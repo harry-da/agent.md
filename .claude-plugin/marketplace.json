@@ -1,11 +1,10 @@
 {
   "name": "agent-md",
   "metadata": {
-    "description": "Harry's personal Claude Code plugin marketplace"
+    "description": "Personal Claude Code plugin marketplace (~/agent.md)"
   },
   "owner": {
-    "name": "Harry Nguyen",
-    "email": "harry.nguyen@airtasker.com"
+    "name": "agent.md"
   },
   "plugins": [
     {

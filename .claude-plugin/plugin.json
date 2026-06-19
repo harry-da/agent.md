@@ -1,9 +1,5 @@
 {
   "name": "personal",
-  "description": "Harry's personal Claude Code skills",
-  "version": "1.0.0",
-  "author": {
-    "name": "Harry Nguyen",
-    "email": "harry.nguyen@airtasker.com"
-  }
+  "description": "Personal Claude Code skills",
+  "version": "1.0.0"
 }

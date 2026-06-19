@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 # One-time bootstrap for ~/agent.md personal Claude Code config.
 # Safe to re-run — all steps are idempotent.
+#
+# Prerequisites: git, claude (Claude Code CLI), jq
+#   brew install jq   (if missing)
+#   Install Claude Code: https://claude.ai/download
 
 set -euo pipefail
 
 REPO_DIR="${HOME}/agent.md"
 SYNC_SCRIPT="${REPO_DIR}/bin/sync.sh"
-SETTINGS_LOCAL="${HOME}/.claude/settings.json"
+SETTINGS="${HOME}/.claude/settings.json"
+
+# Warn if the repo isn't at the expected fixed location
+SCRIPT_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ "$SCRIPT_REPO" != "$REPO_DIR" ]; then
+    echo "⚠️  Warning: this script should be run from ${REPO_DIR}/bin/install.sh"
+    echo "   Scripts and skills hardcode ~/agent.md — clone to that exact path."
+    echo ""
+fi
 
 echo "==> Initialising git repo…"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
@@ -49,27 +61,28 @@ ln -sf "${REPO_DIR}/AGENTS.md" "${HOME}/AGENTS.md"
 echo "    ✓ ~/AGENTS.md → ${REPO_DIR}/AGENTS.md"
 
 echo ""
-echo "==> Wiring SessionStart hook in settings.json…"
-if [ ! -f "$SETTINGS_LOCAL" ]; then
-    printf '{}' > "$SETTINGS_LOCAL"
+echo "==> Wiring SessionStart hook in ~/.claude/settings.json…"
+mkdir -p "${HOME}/.claude"
+if [ ! -f "$SETTINGS" ]; then
+    printf '{}' > "$SETTINGS"
 fi
 
 # Idempotency check: skip if sync.sh is already in any SessionStart hook command
 if command -v jq >/dev/null 2>&1; then
     if jq -e --arg cmd "$SYNC_SCRIPT" \
         '.hooks.SessionStart // [] | map(.hooks // [] | map(.command)) | flatten | any(. == $cmd)' \
-        "$SETTINGS_LOCAL" >/dev/null 2>&1; then
+        "$SETTINGS" >/dev/null 2>&1; then
         echo "    (hook already registered — skipping)"
     else
         jq --arg cmd "$SYNC_SCRIPT" \
             '.hooks.SessionStart = (.hooks.SessionStart // []) + [{"hooks": [{"type": "command", "command": $cmd}]}]' \
-            "$SETTINGS_LOCAL" > "${SETTINGS_LOCAL}.tmp" \
-        && mv "${SETTINGS_LOCAL}.tmp" "$SETTINGS_LOCAL"
+            "$SETTINGS" > "${SETTINGS}.tmp" \
+        && mv "${SETTINGS}.tmp" "$SETTINGS"
         echo "    ✓ Hook registered: ${SYNC_SCRIPT}"
     fi
 else
     echo "    ⚠️  jq not found — skipping hook registration"
-    echo "       Add manually to ~/.claude/settings.local.json:"
+    echo "       Install jq (brew install jq) then re-run this script, or add manually to ~/.claude/settings.json:"
     printf '       {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"%s"}]}]}}\n' "$SYNC_SCRIPT"
 fi
 
