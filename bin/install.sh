@@ -6,7 +6,7 @@ set -euo pipefail
 
 REPO_DIR="${HOME}/agent.md"
 SYNC_SCRIPT="${REPO_DIR}/bin/sync.sh"
-SETTINGS_LOCAL="${HOME}/.claude/settings.local.json"
+SETTINGS_LOCAL="${HOME}/.claude/settings.json"
 
 echo "==> Initialising git repo…"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
@@ -49,7 +49,7 @@ ln -sf "${REPO_DIR}/AGENTS.md" "${HOME}/AGENTS.md"
 echo "    ✓ ~/AGENTS.md → ${REPO_DIR}/AGENTS.md"
 
 echo ""
-echo "==> Wiring SessionStart hook in settings.local.json…"
+echo "==> Wiring SessionStart hook in settings.json…"
 if [ ! -f "$SETTINGS_LOCAL" ]; then
     printf '{}' > "$SETTINGS_LOCAL"
 fi
