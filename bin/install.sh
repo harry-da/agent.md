@@ -28,6 +28,7 @@ git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
 echo ""
 echo "==> Making scripts executable…"
 chmod +x "$SYNC_SCRIPT" "$REPO_DIR/bin/install.sh"
+find "$REPO_DIR/bin" -name "*-mcp-sandboxed.sh" -exec chmod +x {} \;
 
 echo ""
 echo "==> Registering personal plugin marketplace…"
@@ -59,6 +60,17 @@ if [ -e "${HOME}/AGENTS.md" ] && [ ! -L "${HOME}/AGENTS.md" ]; then
 fi
 ln -sf "${REPO_DIR}/AGENTS.md" "${HOME}/AGENTS.md"
 echo "    ✓ ~/AGENTS.md → ${REPO_DIR}/AGENTS.md"
+
+echo ""
+echo "==> Installing sandboxed MCP launchers to ~/.claude/…"
+mkdir -p "${HOME}/.claude"
+for script in "$REPO_DIR"/bin/*-mcp-sandboxed.sh; do
+    [ -f "$script" ] || continue
+    dest="${HOME}/.claude/$(basename "$script")"
+    cp "$script" "$dest"
+    chmod +x "$dest"
+    echo "    ✓ $(basename "$script") → ~/.claude/"
+done
 
 echo ""
 echo "==> Wiring SessionStart hook in ~/.claude/settings.json…"
@@ -93,6 +105,7 @@ echo "   Restart Claude Code or start a new session to activate personal context
 echo "   Personal skills:"
 echo "     /personal:browser-addon-audit  — audit Firefox/Chrome extension supply-chain"
 echo "     /personal:new-skill            — scaffold a new personal skill"
+echo "     /personal:add-mcp              — add a new MCP server with srt sandbox wrapper"
 echo ""
 echo "   To add a remote for cross-machine sync:"
 echo "     git -C ~/agent.md remote add origin <your-private-repo-url>"
