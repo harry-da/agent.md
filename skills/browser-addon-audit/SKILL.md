@@ -3,6 +3,7 @@ description: Audit the provenance, permissions, and supply-chain risk of a brows
 allowed-tools:
   - Bash
   - WebSearch
+  - WebFetch
 argument-hint: "<addon-url-or-id-or-github-repo> [--no-download]"
 ---
 
@@ -16,6 +17,18 @@ Audit the browser extension identified by `$ARGUMENTS`. The argument may be:
 - A GitHub repo URL or `owner/repo` (e.g. `gabrielmaldi/chrome-lock-tab`)
 
 Pass `--no-download` to skip the binary download/hash step (read-only checks only).
+
+---
+
+## Closed-source / no public repo
+
+When no public GitHub repo exists (confirmed by web search returning nothing for `site:github.com <extension-name>`), **Steps 2–4 are N/A**. Document this explicitly:
+
+- Chain of custody is **fully opaque** below the store upload: no build attestation, no SLSA provenance, no source-vs-binary cross-reference possible.
+- State: `Source build → CWS/AMO upload → Store review → Signing → Distribution`. Everything left of the upload is unattested.
+- The audit pivots entirely to binary + behavioural analysis (Steps 5–6).
+
+Do **not** flag "0 releases + 0 tags" or "no CI" as findings — those checks are only meaningful when a repo exists.
 
 ---
 
@@ -100,6 +113,12 @@ for label, pattern in [
 
 Record: published version, user count, last updated date. Note that CWS provides no public
 per-file hash and no machine-readable version history API.
+
+**Also capture the Privacy Practices disclosure** — use WebFetch to retrieve and record
+the CWS listing's "Privacy practices" / "Data usage" block verbatim. Note which data types
+the developer declares collecting (e.g. "Web history", "Browsing history", "Personal info")
+and the stated purpose/sharing commitments. This is privacy-relevant and not machine-readable
+from the raw HTML.
 
 ---
 
@@ -187,11 +206,23 @@ Cross-reference source permissions with the store's declared permissions. Discre
 
 ## Step 5 — Download and inspect the binary (skip with `--no-download`)
 
+### Work directory
+
+Use the session scratchpad directory if one is specified in the system context (typically
+`/private/tmp/claude-<uid>/.../scratchpad/`). Only fall back to `/tmp` if no scratchpad
+is provided. Name the audit subdirectory `addon-audit-<id>`:
+
+```bash
+AUDIT_DIR="${SCRATCHPAD:-/tmp}/addon-audit-${SLUG:-${EXTENSION_ID}}"
+mkdir -p "${AUDIT_DIR}"
+cd "${AUDIT_DIR}"
+```
+
 ### Firefox (XPI)
 
 ```bash
-mkdir -p /tmp/addon-audit-${SLUG}
-cd /tmp/addon-audit-${SLUG}
+mkdir -p "${AUDIT_DIR}"
+cd "${AUDIT_DIR}"
 
 DOWNLOAD_URL=$(curl -s "https://addons.mozilla.org/api/v5/addons/addon/${SLUG}/" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["current_version"]["file"]["url"])')
@@ -237,8 +268,8 @@ openssl pkcs7 -inform DER -in extracted/META-INF/mozilla.rsa -print_certs -noout
 ### Chrome (CRX3)
 
 ```bash
-mkdir -p /tmp/addon-audit-${EXTENSION_ID}
-cd /tmp/addon-audit-${EXTENSION_ID}
+mkdir -p "${AUDIT_DIR}"
+cd "${AUDIT_DIR}"
 
 # Download CRX from the CWS update endpoint
 curl -sL "https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx3&prodversion=131&x=id%3D${EXTENSION_ID}%26installsource%3Dondemand%26uc" \
@@ -296,66 +327,161 @@ for f in payload['content_hashes'][0]['files']:
 
 Verify:
 - `item_id` matches the extension ID in the CWS URL
-- `item_version` matches the published version and GitHub source
+- `item_version` matches the published version and GitHub source (or CWS listing if closed-source)
 - Signatures include both `"publisher"` and `"webstore"` kid entries (Google dual-signing)
 
 **Note:** Unlike Firefox, there is no independently verifiable SHA-256 hash published by Google.
 The chain of trust is: Chrome trusts Google's JWS signature → Google ran the review.
 
-#### 5c-CR — Permissions comparison
+#### 5c-CR — Full MV3 manifest inspection
+
+Read and assess **all** security-relevant manifest fields, not just permissions:
 
 ```bash
 python3 -c "
 import json
-crx = json.load(open('extracted/manifest.json'))
-print('CRX permissions:')
-for p in crx.get('permissions', []): print(' ', p)
-print('CRX host_permissions:')
-for p in crx.get('host_permissions', []): print(' ', p)
-print('CRX content_scripts matches:')
-for cs in crx.get('content_scripts', []):
-    print(' ', cs.get('matches'))
+m = json.load(open('extracted/manifest.json'))
+
+print('=== Core ===')
+print('manifest_version:', m.get('manifest_version'))
+print('version:         ', m.get('version'))
+print('key present:     ', bool(m.get('key')))
+
+print()
+print('=== Permissions ===')
+print('permissions:              ', m.get('permissions', []))
+print('optional_permissions:     ', m.get('optional_permissions', []))
+print('host_permissions:         ', m.get('host_permissions', []))
+print('optional_host_permissions:', m.get('optional_host_permissions', []))
+
+print()
+print('=== Content scripts ===')
+for cs in m.get('content_scripts', []):
+    print('  matches:', cs.get('matches'), '| js:', cs.get('js'))
+
+print()
+print('=== externally_connectable ===')
+print(m.get('externally_connectable', 'NONE'))
+
+print()
+print('=== CSP ===')
+print(m.get('content_security_policy', 'NOT SET (MV3 default applies: script-src self; object-src self)'))
+
+print()
+print('=== web_accessible_resources ===')
+print(m.get('web_accessible_resources', 'NONE'))
+
+print()
+print('=== Background ===')
+print(m.get('background', 'NONE'))
+
+print()
+print('=== oauth2 / key ===')
+print('oauth2:', m.get('oauth2', 'NONE'))
 "
 ```
 
-Cross-reference against the GitHub source manifest. Note that CWS automatically injects `update_url` — that is expected and not a red flag.
+**Field-by-field assessment:**
+
+- `externally_connectable.matches` — **critical for extensions with a companion web app**. Which web origins can message the background service worker directly? Broad patterns (wildcards, many domains) dramatically expand the attack surface. For each allowed origin, ask: if that origin were XSS'd or its subdomain taken over, what extension APIs would the attacker control?
+- `content_security_policy` — flag `unsafe-eval`, `unsafe-inline`, or remote script sources. MV3 default is strict; any override is a red flag.
+- `web_accessible_resources` — exposes extension files to web pages. Used for fingerprinting. Note which patterns are listed.
+- `background.service_worker` (MV3) vs `background.scripts`/`background.page` (MV2) — MV3 service workers have shorter lifetimes and reduce ambient footprint.
+- `optional_permissions` / `optional_host_permissions` — granted only when a feature is enabled. Still auditable and still real attack surface once granted.
+
+Cross-reference permissions against the GitHub source manifest if available. Note that CWS automatically injects `update_url` — that is expected and not a red flag.
 
 ---
 
-## Step 6 — JS red-flag scan
+## Step 6 — JS behavioural analysis
 
-Run against all background scripts and content scripts from `extracted/`:
+### 6a — Detect minification and beautify before scanning
+
+Most production extensions ship minified webpack bundles. A grep scan on a single-line 130 KB file
+is near-useless: the ±200-char context window around a `fetch(` match is unreadable, and false
+positives from vendored libs swamp real findings.
+
+**Always beautify before scanning:**
 
 ```bash
-# Find all JS files in the extension
-JS_FILES=$(find extracted/ -name "*.js" -not -path "*/node_modules/*")
+# Check minification: if line count << char count, it's minified
+wc -l extracted/*.js
 
-echo "=== eval / new Function ==="
-grep -rn 'eval(\|new Function' $JS_FILES | grep -v '//' | head -20
+# Check for source maps (clean de-minification if present)
+grep -o 'sourceMappingURL=.*' extracted/*.js | head -5
 
-echo "=== fetch() targets ==="
-python3 -c "
-import re, glob
-for f in glob.glob('extracted/**/*.js', recursive=True):
-    content = open(f).read()
-    for m in re.finditer(r'fetch\(', content):
-        start = max(0, m.start()-200); end = min(len(content), m.end()+300)
-        print(f'--- {f} offset {m.start()} ---'); print(content[start:end]); print()
-"
+# Beautify with js-beautify
+npx --yes js-beautify --indent-size 2 extracted/background.js -o beautified/background.js
+# Repeat for each JS file
 
-echo "=== external URLs ==="
-grep -ohE 'https?://[a-zA-Z0-9._/-]+' $JS_FILES \
-  | sort -u | grep -v 'chrome-extension\|moz-extension\|localhost\|clients2.google' | head -20
+wc -l beautified/background.js  # should be 5–20× the minified line count
+```
 
-echo "=== base64 blobs ==="
-grep -oE '[A-Za-z0-9+/]{100,}={0,2}' $JS_FILES | head -5
+If source maps are present, use them — they give original variable names and make the analysis
+far more meaningful.
+
+### 6b — Red-flag scan (run on beautified files)
+
+```bash
+BDIR=beautified
+JS_FILES=$(find ${BDIR}/ -name "*.js")
+
+echo "=== eval() / new Function() ==="
+grep -n 'eval(\|new Function' ${JS_FILES} | grep -v '//' | head -20
+
+echo "=== fetch() / XMLHttpRequest / WebSocket ==="
+grep -n '\bfetch(\|XMLHttpRequest\|new WebSocket\|\.open(' ${JS_FILES} | head -30
 
 echo "=== dynamic import() ==="
-grep -n 'import(' $JS_FILES | head -10
+grep -n '\bimport(' ${JS_FILES} | head -10
 
-echo "=== XMLHttpRequest / WebSocket ==="
-grep -n 'XMLHttpRequest\|WebSocket\|open.*GET.*http' $JS_FILES | head -10
+echo "=== external URLs (sorted, deduplicated) ==="
+grep -ohE 'https?://[a-zA-Z0-9._:/?=&#%@!~^-]+' ${JS_FILES} \
+  | sort -u \
+  | grep -v 'chrome-extension://\|moz-extension://\|localhost\|clients2\.google\.' \
+  | head -40
+
+echo "=== base64 blobs (>100 chars) ==="
+grep -oE '[A-Za-z0-9+/]{100,}={0,2}' ${JS_FILES} | head -5
 ```
+
+### 6c — Deep behavioural analysis (for commercial/closed-source/high-risk extensions)
+
+For extensions with broad permissions or large user bases, do a manual read of the background
+service worker after beautifying. Focus on:
+
+**Network destinations — classify, don't just list:**
+- First-party backend (expected for sync products): `api.vendor.com`, `*.vendor.com`
+- Third-party analytics/telemetry: Segment, Amplitude, Datadog RUM, Sentry, Intercom, Google Analytics — privacy-relevant; enumerate each one
+- Ad/tracking SDKs: flag immediately
+- Categorise every external URL as first-party or third-party
+
+**Auth/token handling:**
+- Where are credentials stored? (`chrome.storage.local`, `chrome.storage.sync`, cookies)
+- Are tokens or session IDs logged to the console?
+- Are auth headers constructed and to which endpoints?
+
+**`externally_connectable` message handlers — always inspect for web-app companions:**
+
+If the manifest declares `externally_connectable.matches`, find and read the
+`onMessageExternal` and `onConnectExternal` handlers:
+
+```bash
+grep -n 'onMessageExternal\|onConnectExternal' ${JS_FILES}
+```
+
+Then locate the dispatch function they call and enumerate every method/case:
+- What data can an allowed-origin page read? (full tab state, history, settings, IDs)
+- What mutations can it trigger? (tab navigation, tab creation, tab discard, settings changes)
+- Is there an additional origin check *inside* the handler, or does it rely solely on the manifest's `externally_connectable` restriction?
+- Are any methods explicitly blocked from web clients (e.g. `if (e.fromWebClient) throw`)? Note which ones are and which aren't.
+- Does the handler have a generic API-proxy path (e.g. `default: callChromeAPI(e.path, ...e.args)`) that bypasses per-method review?
+
+**Popup / UI shell pattern:**
+If `popup.html` renders the extension UI as an iframe pointing to the extension's own web app,
+that means the UI is server-controlled and can change without a store review cycle. Note:
+- Does the `postMessage` listener validate `e.origin`?
+- Is the iframe sandboxed?
 
 Flag anything that makes outbound network calls to non-extension origins.
 
@@ -382,6 +508,18 @@ Rate overall blast radius: LOW / MODERATE / HIGH.
 - `tabs` + `webRequest` + host: full MITM capability — **CRITICAL**
 - `scripting` + `<all_urls>`: can inject arbitrary code into any page — **CRITICAL**
 - `content_scripts: <all_urls>`: broad DOM access on every page — **MODERATE** baseline, escalates if JS is compromised
+- `history`: full read/write/delete of browsing history — **HIGH** capability (actual risk depends on what the code does with it; read the handler)
+- `cookies` + host permission: can read/write session cookies — **HIGH**
+- `cookies` + `<all_urls>`: can steal session tokens from any site — **CRITICAL**
+- `webRequest` + `<all_urls>` + `blocking`: can intercept and modify all HTTP traffic — **CRITICAL**
+- `declarativeNetRequest` / `declarativeNetRequestWithHostAccess`: can rewrite/block network requests via rules — **HIGH** (rules may be updated dynamically)
+- `debugger`: can attach to any tab's JS runtime, read all JS memory/variables, breakpoint execution — **CRITICAL**
+- `management`: can install, uninstall, enable, or disable other extensions — **CRITICAL**
+- `nativeMessaging`: can communicate with arbitrary native binaries on the host OS — **CRITICAL** (escapes browser sandbox)
+- `proxy`: can redirect all browser traffic through an attacker-controlled proxy — **CRITICAL**
+- `downloads`: can write files to disk without user file-picker — **HIGH**
+- `<all_urls>` as a host permission alone: extension can make credentialed requests to any site the user is logged into — **HIGH**
+- `externally_connectable` with broad wildcards: any web page matching the pattern can invoke extension APIs — **HIGH**; assess each exposed method individually
 
 ### Supply-Chain Risk
 Identify the most likely compromise paths. Rate: LOW / MODERATE / HIGH.
@@ -410,7 +548,7 @@ Key factors: store account security, build attestation (CI/CD vs manual), depend
 ## Cleanup (optional)
 
 ```bash
-rm -rf /tmp/addon-audit-${SLUG:-${EXTENSION_ID}}
+rm -rf "${AUDIT_DIR}"
 ```
 
 ---
@@ -440,3 +578,13 @@ rm -rf /tmp/addon-audit-${SLUG:-${EXTENSION_ID}}
 - Version history / commit history shows a sudden new sensitive permission
   (`<all_urls>`, `cookies`, `scripting`, `webRequest`, `nativeMessaging`)
 - Deployment creator is `vercel[bot]` / `netlify[bot]` (website deploy, not extension)
+- `onMessageExternal` registered to the **same handler** as `onMessage` with no additional
+  origin check inside — relies solely on `externally_connectable` manifest restriction;
+  assess the full attack surface of what an allowed-origin XSS could invoke
+- Generic API-proxy dispatch (e.g. `default: callChromeAPI(e.path, ...args)`) exposed
+  to `externally_connectable` origins — all permissions become callable by the web app
+- `popup.html` rendering extension UI as an `<iframe>` to the extension's own web server
+  with no `sandbox` attribute and no `e.origin` check in `postMessage` listener —
+  popup UI is server-controlled and can change without a store review cycle
+- Third-party analytics/telemetry SDKs embedded in the extension binary (Segment, Amplitude,
+  Intercom, Datadog RUM, etc.) — enumerate each one and note what data they receive
